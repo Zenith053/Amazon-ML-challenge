@@ -38,12 +38,35 @@ DECISION = WORK / tagged("decision.json")
 log = get("matcher")
 
 
+# Cross-encoder models to use, by name ('' = the first model). BER_CE_NAMES=",m2,cb" -> 3 models.
+CE_NAMES = os.environ.get("BER_CE_NAMES", "").split(",")
+
+
+def _sx(name: str) -> str:
+    return f"_{name}" if name else ""
+
+
+def ce_names(split: str) -> list[str]:
+    return [n for n in CE_NAMES if (WORK / f"{split}_ce{_sx(n)}.parquet").exists()]
+
+
 def has_ce(split: str) -> bool:
-    return (WORK / f"{split}_ce.parquet").exists()
+    return bool(ce_names(split))
 
 
 def features(split: str) -> list[str]:
-    return BASE_FEATURES + (["ce_logit", "ce_rank", "ce_gap", "ce_scored"] if has_ce(split) else [])
+    names = ce_names(split)
+    if not names:
+        return BASE_FEATURES
+    per = [f"{f}{_sx(n)}" for n in names for f in ("ce_logit", "ce_rank", "ce_gap")]
+    ens = ["ce_mean", "ce_std", "ce_mean_rank", "ce_mean_gap"] if len(names) > 1 else []
+    return BASE_FEATURES + per + ["ce_scored"] + ens
+
+
+def ctx_file(split: str):
+    """Context features to read; BER_CTX_TAG lets a later version reuse an earlier one's (e.g. v3 -> v2)."""
+    t = os.environ.get("BER_CTX_TAG", TAG)
+    return WORK / (f"{split}_ctx_{t}.parquet" if t else f"{split}_ctx.parquet")
 
 
 def build_ctx(split: str, q_chunk: int = 100_000) -> None:
@@ -70,15 +93,26 @@ def build_ctx(split: str, q_chunk: int = 100_000) -> None:
 
 
 def _rows(split: str, q_ids: pl.Series) -> pl.DataFrame:
-    c = pl.scan_parquet(WORK / tagged(f"{split}_ctx.parquet")).filter(pl.col("q_idx").is_in(q_ids.implode()))
-    if has_ce(split):
-        ce = pl.scan_parquet(WORK / f"{split}_ce.parquet").filter(pl.col("q_idx").is_in(q_ids.implode()))
-        # gated scoring: only uncertain pairs have a cross-encoder score; others stay null
+    c = pl.scan_parquet(ctx_file(split)).filter(pl.col("q_idx").is_in(q_ids.implode()))
+    names = ce_names(split)
+    for n in names:
+        lg = f"ce_logit{_sx(n)}"
+        ce = (pl.scan_parquet(WORK / f"{split}_ce{_sx(n)}.parquet").filter(pl.col("q_idx").is_in(q_ids.implode()))
+              .rename({"ce_logit": lg}))
+        # only scored pairs (top-k) have a cross-encoder score; others stay null
         c = c.join(ce, on=["q_idx", "p_idx"], how="left").with_columns(
-            ce_rank=pl.col("ce_logit").rank("ordinal", descending=True).over("q_idx").cast(pl.Float32),
-            ce_gap=(pl.col("ce_logit").max().over("q_idx") - pl.col("ce_logit")),
-            ce_scored=pl.col("ce_logit").is_not_null().cast(pl.Int8),
+            pl.col(lg).rank("ordinal", descending=True).over("q_idx").cast(pl.Float32).alias(f"ce_rank{_sx(n)}"),
+            (pl.col(lg).max().over("q_idx") - pl.col(lg)).alias(f"ce_gap{_sx(n)}"),
         )
+    if names:
+        lgs = [pl.col(f"ce_logit{_sx(n)}") for n in names]
+        c = c.with_columns(ce_scored=lgs[0].is_not_null().cast(pl.Int8))
+        if len(names) > 1:
+            # ensemble of models: average and disagreement of the logits
+            c = c.with_columns(ce_mean=pl.mean_horizontal(lgs),
+                               ce_std=pl.concat_list(lgs).list.std()).with_columns(
+                ce_mean_rank=pl.col("ce_mean").rank("ordinal", descending=True).over("q_idx").cast(pl.Float32),
+                ce_mean_gap=pl.col("ce_mean").max().over("q_idx") - pl.col("ce_mean"))
     return c.select(["q_idx", "p_idx", *features(split)]).collect()
 
 
@@ -112,7 +146,7 @@ def eligible_train_queries() -> tuple[pl.Series, pl.Series]:
     if has_ce("train"):
         # the fixed hash sample the cross-encoder scored (gating keeps only uncertain pairs, but every
         # query in the sample took part, so the sample itself is unbiased)
-        meta = json.loads((WORK / "train_ce_meta.json").read_text())
+        meta = json.loads((WORK / f"train_ce{_sx(ce_names('train')[0])}_meta.json").read_text())
         s1 = s1.filter(in_score_share(pl.col("entity_id"), meta["share"]))
     all_q = s1["idx"]
     full = pl.read_parquet(WORK / "train_s1.parquet", columns=["idx"])["idx"]
