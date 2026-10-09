@@ -291,7 +291,10 @@ Steps 2–5 can run as one chained Kaggle job attaching all 7 candidate outputs.
    - the matcher re-run with `ce_logit`, and its out-of-fold F0.5 compared against v1
 2. **France check:** leave-one-country-out validation (train on US and test on India, then the reverse) as a stand-in for the unseen country.
 3. **Recall beyond 98.5%:** dense multilingual bi-encoder retrieval on GPU, and splitting glued website/handle names into words.
-4. **Final package:** `README.md`, pinned `requirements.txt`, filled-in `Documentation_template.md`, and the zip with `output/` + `code/`.
+4. **Final package** for team **Kernel Squad** (Shobhan Parida, team leader; Shubham Paliwal; Peeyush Prashant; Rahul Saha):
+   - `business_entity_resolution/README.md` and pinned `requirements.txt`: **drafted** (final runtimes still to fill in)
+   - `Documentation_template.md`: to be written **at the end**, from the final model's real results
+   - `Kernel_Squad_submission.zip` (`output/` + `code/` + document), built and validated in a final Kaggle job and downloaded compressed
 
 ### Open issues and risks
 - **Candidate job runtimes are estimates.** If a job gets close to Kaggle's 12 h limit it would lose its output; per-country/shard splitting is the safeguard.

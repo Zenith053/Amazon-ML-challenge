@@ -1,21 +1,20 @@
-# Python 3.12
-# Core pipeline (CPU): normalisation, blocking, n-gram BM25, features, LightGBM
+# Python 3.12 (outputs produced on Kaggle images with Python 3.12.13)
+# Core pipeline (CPU): normalisation, blocking, BM25 n-grams, features, LightGBM
 polars==1.44.2
-pyarrow==25.0.1
-numpy==2.5.3
-scipy==1.18.1
-scikit-learn==1.9.1
+pyarrow==24.0.0
+numpy==2.0.2
+scipy==1.16.3
+scikit-learn==1.6.1
 rapidfuzz==3.14.6
 anyascii==0.3.3
 lightgbm==4.7.0
 sparse-dot-topn==1.2.0
 
-# Running the pipeline on Kaggle from a local terminal
-kaggle==2.2.4
-gdown
+# Cross-encoders (GPU; we used 2x NVIDIA T4, CUDA build of torch)
+torch==2.10.0
+transformers==5.0.0
+accelerate==1.13.0
 
-# Optional GPU stage (cross-encoder, microsoft/mdeberta-v3-base, MIT licence);
-# versions pinned once the stage is run on Kaggle
-# torch
-# transformers
-# accelerate
+# Running the stages as Kaggle jobs from a local terminal (optional)
+kaggle==2.2.4
+

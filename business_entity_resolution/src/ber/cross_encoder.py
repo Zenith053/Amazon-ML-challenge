@@ -49,6 +49,13 @@ def reserved_split(reserved_q: pl.Series) -> tuple[pl.Series, pl.Series]:
     return q.filter(~q.is_in(val.implode())), val
 
 
+def _accelerator():
+    from datetime import timedelta
+    from accelerate import Accelerator, InitProcessGroupKwargs
+    # default NCCL timeout is 10 min; one GPU can finish its shard much later than the other
+    return Accelerator(mixed_precision="fp16", kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=4))])
+
+
 def record_text(split: str, which: str) -> pl.DataFrame:
     path = WORK / (f"{split}_s1.parquet" if which == "s1" else f"{split}_pool.parquet")
     return pl.scan_parquet(path).select(
@@ -125,7 +132,7 @@ def train(keep_k: int, neg_per_q: int, epochs: float, lr: float, bs: int, limit_
     from accelerate import Accelerator
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
-    acc = Accelerator(mixed_precision="fp16")
+    acc = _accelerator()
     if train_set == "all-but-val":
         df = pair_frame("train", keep_k, only_ce=True)
         pool, _ = reserved_split(df["q_idx"])
@@ -264,11 +271,11 @@ def validate(keep_k: int, bs: int, name: str) -> None:
 
 @torch.no_grad()
 def score(split: str, keep_k: int, bs: int, share: float, limit_q: int, gate: str, band: tuple[float, float],
-          name: str) -> None:
+          name: str, rows: str = "") -> None:
     from accelerate import Accelerator
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-    acc = Accelerator(mixed_precision="fp16")
+    acc = _accelerator()
     df = pair_frame(split, keep_k, only_ce=False if split == "train" else None, limit_q=limit_q)
     if share < 1.0:
         df = df.filter(in_score_share(pl.col("s1_id"), share))
@@ -280,8 +287,14 @@ def score(split: str, keep_k: int, bs: int, share: float, limit_q: int, gate: st
         if acc.is_main_process:
             log.info(f"gate {gate} band {band}: {df.height:,} of {n_before:,} pairs kept ({df.height / max(n_before, 1):.1%})")
     df = df.sort(["q_idx", "p_idx"])
+    tag = ""
+    if rows:
+        # only rows r % n == k of the full sorted frame: exactly the shard process k wrote in an n-GPU run
+        k, n = (int(x) for x in rows.split("/"))
+        df = df.with_row_index("r0").filter(pl.col("r0") % n == k).drop("r0")
+        tag = f".rows{k}of{n}"
     if acc.is_main_process:
-        log.info(f"scoring {split}: {df.height:,} pairs from {df['q_idx'].n_unique():,} S1 on {acc.num_processes} GPU(s)")
+        log.info(f"scoring {split}{tag}: {df.height:,} pairs from {df['q_idx'].n_unique():,} S1 on {acc.num_processes} GPU(s)")
     shard = df.with_row_index("r").filter(pl.col("r") % acc.num_processes == acc.process_index)
     # sort by length within the shard to minimise padding
     shard = shard.with_columns(L=pl.col("q_text").str.len_chars() + pl.col("p_text").str.len_chars()).sort("L")
@@ -303,19 +316,20 @@ def score(split: str, keep_k: int, bs: int, share: float, limit_q: int, gate: st
         log.warning(f"process {acc.process_index}: {n_bad:,} non-finite scores (fp16 overflow?) -> set to -20")
         scores = np.where(np.isfinite(scores), scores, -20.0).astype(np.float32)
     shard.select("q_idx", "p_idx").with_columns(ce_logit=pl.Series(scores)).write_parquet(
-        WORK / f"{split}_ce{sfx(name)}.part{acc.process_index}.parquet"
+        WORK / f"{split}_ce{sfx(name)}{tag}.part{acc.process_index}.parquet"
     )
     acc.wait_for_everyone()
     if acc.is_main_process:
-        parts = [WORK / f"{split}_ce{sfx(name)}.part{i}.parquet" for i in range(acc.num_processes)]
+        parts = [WORK / f"{split}_ce{sfx(name)}{tag}.part{i}.parquet" for i in range(acc.num_processes)]
         res = pl.concat([pl.read_parquet(p) for p in parts])
-        res.write_parquet(WORK / f"{split}_ce{sfx(name)}.parquet")
+        res.write_parquet(WORK / f"{split}_ce{sfx(name)}{tag}.parquet")
         for p in parts:
             p.unlink()
-        log.info(f"wrote {split}_ce{sfx(name)}.parquet: {res.height:,} pairs, logit mean {res['ce_logit'].mean():.2f} "
+        log.info(f"wrote {split}_ce{sfx(name)}{tag}.parquet: {res.height:,} pairs, logit mean {res['ce_logit'].mean():.2f} "
                  f"({time.time() - t:.0f}s)")
         meta = {"share": share, "keep_k": keep_k, "gate": gate, "band": list(band)}
-        (WORK / f"{split}_ce{sfx(name)}_meta.json").write_text(json.dumps(meta))
+        if not rows:
+            (WORK / f"{split}_ce{sfx(name)}_meta.json").write_text(json.dumps(meta))
 
 
 if __name__ == "__main__":
@@ -342,6 +356,7 @@ if __name__ == "__main__":
     ap.add_argument("--pseudo", default="", help="probability parquet for self-training labels, e.g. test_probs_v2.parquet")
     ap.add_argument("--pseudo-country", default="France")
     ap.add_argument("--pseudo-q", type=int, default=50_000)
+    ap.add_argument("--rows", default="", help="k/n: score only rows r %% n == k (redo one crashed GPU shard)")
     a = ap.parse_args()
     if a.step == "train":
         train(a.keep_k, a.neg_per_q, a.epochs, a.lr, a.bs, a.limit_q, not a.no_freeze_emb, a.name, a.base,
@@ -349,4 +364,4 @@ if __name__ == "__main__":
     elif a.step == "validate":
         validate(a.keep_k, a.bs, a.name)
     else:
-        score(a.split, a.keep_k, a.bs, a.share, a.limit_q, a.gate, tuple(a.band), a.name)
+        score(a.split, a.keep_k, a.bs, a.share, a.limit_q, a.gate, tuple(a.band), a.name, a.rows)

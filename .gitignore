@@ -10,3 +10,6 @@ __pycache__/
 *.npy
 *.faiss
 *.zip
+submissions/
+work_small/
+package/

@@ -181,11 +181,18 @@ def oof(n_train_q: int, rounds: int) -> None:
         log.info(f"competition context: {rest['q_idx'].n_unique():,} other queries from v1 OOF")
         pr = pl.concat([pr, rest.select(pr.columns)])
     best = choose_rule(pr, good)
-    v1_cfg = WORK / "decision.json"
-    if TAG and v1.exists() and v1_cfg.exists():
-        f_v1 = eval_cfg(pl.read_parquet(v1), good, json.loads(v1_cfg.read_text()))
-        log.info(f"SAME EVAL SET ({len(good):,} S1): v1 F0.5 {f_v1:.4f}  vs  {TAG} F0.5 {best['oof_f05']:.4f}  "
-                 f"(delta {best['oof_f05'] - f_v1:+.4f})")
+    # compare with earlier versions on exactly the same queries and competition context
+    for base in ("", *filter(None, os.environ.get("BER_BASELINE", "").split(","))):
+        b_oof, b_cfg = WORK / f"train_oof{_sx(base)}.parquet", WORK / f"decision{_sx(base)}.json"
+        if not (TAG and b_oof.exists() and b_cfg.exists() and v1.exists()):
+            continue
+        b = pl.read_parquet(b_oof)
+        if base:  # later versions only predicted the scored sample: fill the rest from v1, like above
+            b = pl.concat([b, pl.read_parquet(v1).filter(~pl.col("q_idx").is_in(b["q_idx"].unique().implode()))
+                           .select(b.columns)])
+        f_b = eval_cfg(b, good, json.loads(b_cfg.read_text()))
+        log.info(f"SAME EVAL SET ({len(good):,} S1): {base or 'v1'} F0.5 {f_b:.4f}  vs  {TAG} F0.5 "
+                 f"{best['oof_f05']:.4f}  (delta {best['oof_f05'] - f_b:+.4f})")
 
 
 def choose_rule(pr: pl.DataFrame, eval_q: pl.Series) -> dict:
